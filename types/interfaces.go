@@ -1,6 +1,13 @@
 package types
 
-type EventStore[key any] interface {
-	List(ResourceKey) []Event
-	Add(ResourceKey, Event) bool
+import (
+	"context"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+type EventStore interface {
+	List(ctx context.Context, key ResourceKey) ([]Event, error)
+	Add(ctx context.Context, event ...KeyedEvent) error
+	GetResourceKeyFromUnstructured(obj unstructured.Unstructured) ResourceKey
 }
