@@ -3,8 +3,8 @@ package recorder
 import (
 	"context"
 	"fmt"
-	"strings"
 
+	"github.com/loft-sh/magpie/pkg/client/filtered"
 	"github.com/loft-sh/magpie/pkg/eventstores/idempotent"
 	"github.com/loft-sh/magpie/types"
 	errors2 "github.com/pkg/errors"
@@ -19,6 +19,23 @@ import (
 
 var _ reconcile.TypedReconciler[ctrl.Request]
 
+var (
+	requiredFields = [][]string{
+		{
+			"metadata",
+			"namespace",
+		},
+		{
+			"metadata",
+			"name",
+		},
+		{
+			"metadata",
+			"uid",
+		},
+	}
+)
+
 type Target struct {
 	GVK         schema.GroupVersionKind
 	Fields      [][]string
@@ -27,19 +44,18 @@ type Target struct {
 }
 
 type Reconciler struct {
-	Client      client.Client
-	configMapNS string
-	target      Target
-	store       types.EventStore
+	Client         client.Client
+	filteredReader filtered.Reader
+	configMapNS    string
+	target         Target
+	store          types.EventStore
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
-	obj := unstructured.Unstructured{}
-	obj.SetGroupVersionKind(r.target.GVK)
-	err := r.Client.Get(ctx, client.ObjectKey{Name: request.Name, Namespace: request.Namespace}, &obj)
+	obj, err := r.filteredReader.Get(ctx, client.ObjectKey{Name: request.Name, Namespace: request.Namespace})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			err = r.SyncTargetDelete(ctx, r.store.GetResourceKeyFromUnstructured(obj))
+			err = r.SyncTargetDelete(ctx, types.ResourceKey{NamespacedName: request.NamespacedName})
 			if err != nil {
 				return reconcile.Result{}, errors2.Wrap(err, "failed to sync delete event")
 			}
@@ -67,9 +83,9 @@ func (r *Reconciler) SyncTargetCreate(ctx context.Context, obj unstructured.Unst
 				NamespacedName: ktypes.NamespacedName{
 					Namespace: obj.GetNamespace(),
 					Name:      obj.GetName()},
-				UID:              obj.GetUID(),
-				GroupVersionKind: r.target.GVK},
-			Event: types.Event{Obj: r.createEventFromTarget(obj.Object), EventType: types.Create},
+				UID: obj.GetUID(),
+			},
+			Event: types.Event{Obj: obj.Object, EventType: types.Create},
 		})
 	if err != nil {
 		return fmt.Errorf("failed to add event to store: %w", err)
@@ -91,29 +107,28 @@ func (r *Reconciler) SyncTargetDelete(ctx context.Context, key types.ResourceKey
 	return nil
 }
 
-func (r *Reconciler) createEventFromTarget(obj map[string]interface{}) map[string]interface{} {
-	filteredObj := make(map[string]interface{})
-	for _, field := range r.target.Fields {
-		val := getNested(obj, field...)
-		setNested(filteredObj, val, field...)
-	}
-	return filteredObj
-}
-
 func SetupWithManagerForTargets(ctx context.Context, mgr ctrl.Manager, targets []Target, cmNS string) error {
 	for _, target := range targets {
-		eventStore, err := idempotent.NewStore(cmNS, target.GVK, mgr.GetClient())
+		filteredReader := filtered.NewReader(mgr.GetClient(), target.GVK, append(target.Fields, requiredFields...))
+		eventStore, err := idempotent.NewStore(cmNS, target.GVK, mgr.GetClient(), filteredReader)
 		if err != nil {
 			return errors2.Wrap(err, "failed to create event store")
 		}
 
 		r := &Reconciler{
-			Client:      mgr.GetClient(),
-			target:      target,
-			store:       eventStore,
-			configMapNS: cmNS,
+			Client:         mgr.GetClient(),
+			filteredReader: filteredReader,
+			target:         target,
+			store:          eventStore,
+			configMapNS:    cmNS,
 		}
-		err = eventStore.InitializeForGVK(ctx, cmNS)
+
+		list, err := r.filteredReader.List(ctx, &client.ListOptions{})
+		if err != nil {
+			return errors2.Wrap(err, fmt.Sprintf("failed to list e.gvk [%s]", target.GVK.String()))
+		}
+
+		err = eventStore.InitializeForGVK(ctx, cmNS, list)
 		if err != nil {
 			return errors2.Wrapf(err, "failed to initialize event store for gvk [%s]", target.GVK.String())
 		}
@@ -128,47 +143,4 @@ func SetupWithManagerForTargets(ctx context.Context, mgr ctrl.Manager, targets [
 		}
 	}
 	return nil
-}
-
-func (r *Reconciler) parseResourceKeyFromString(key string) (types.ResourceKey, error) {
-	parts := strings.Split(key, "_")
-	if len(parts) != 3 {
-		return types.ResourceKey{}, fmt.Errorf("invalid resource key string [%s], should be of format \"Namespace-Name-UID\"", key)
-	}
-	return types.ResourceKey{NamespacedName: ktypes.NamespacedName{Namespace: parts[0], Name: parts[1]}, UID: ktypes.UID(parts[2]), GroupVersionKind: r.target.GVK}, nil
-}
-
-func setNested(obj map[string]interface{}, val any, keys ...string) {
-	if obj == nil || len(keys) == 0 {
-		return
-	}
-
-	if len(keys) == 1 {
-		obj[keys[0]] = val
-		return
-	}
-
-	obj[keys[0]] = make(map[string]interface{})
-	nestedObj := obj[keys[0]].(map[string]interface{})
-	setNested(nestedObj, val, keys[1:]...)
-}
-
-func getNested(obj map[string]interface{}, keys ...string) any {
-	var t any
-	if obj == nil || len(keys) == 0 {
-		return t
-	}
-
-	if len(keys) == 1 {
-		return obj[keys[0]]
-	}
-
-	switch v := obj[keys[0]].(type) {
-	case map[string]interface{}:
-		if len(keys) > 1 {
-			return getNested(v, keys[1:]...)
-		}
-	}
-
-	return t
 }
