@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loft-sh/magpie/pkg/client/filtered"
 	"github.com/loft-sh/magpie/types"
 	errors2 "github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
@@ -27,13 +28,14 @@ const (
 
 type Store struct {
 	sync.RWMutex
-	client      client.Client
-	configMapNS string
-	gvk         schema.GroupVersionKind
+	client         client.Client
+	filteredReader filtered.Reader
+	configMapNS    string
+	gvk            schema.GroupVersionKind
 }
 
-func NewStore(ns string, gvk schema.GroupVersionKind, client client.Client) (*Store, error) {
-	return &Store{configMapNS: ns, gvk: gvk, client: client}, nil
+func NewStore(ns string, gvk schema.GroupVersionKind, client client.Client, reader filtered.Reader) (*Store, error) {
+	return &Store{configMapNS: ns, gvk: gvk, client: client, filteredReader: reader}, nil
 }
 
 func (e *Store) List(ctx context.Context, key types.ResourceKey) ([]types.Event, error) {
@@ -45,6 +47,13 @@ func (e *Store) List(ctx context.Context, key types.ResourceKey) ([]types.Event,
 		return nil, fmt.Errorf("failed to get configmap: %w", err)
 	}
 
+	existingKey, matched, err := inferFullKey(cm, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to infer full key: %w", err)
+	}
+	if matched {
+		key = existingKey
+	}
 	events, err := e.listEventsFromConfigMap(cm, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events: %w", err)
@@ -70,6 +79,15 @@ func (e *Store) Add(ctx context.Context, eventsToAdd ...types.KeyedEvent) error 
 
 	updated := false
 	for _, keyedEvent := range eventsToAdd {
+		existingKey, matched, err := inferFullKey(cm, keyedEvent.Key)
+		if err != nil {
+			return fmt.Errorf("failed to infer full key: %w", err)
+		}
+
+		if matched {
+			keyedEvent.Key = existingKey
+		}
+
 		currentEvents, err := e.listEventsFromConfigMap(cm, keyedEvent.Key)
 		if err != nil {
 			return fmt.Errorf("failed to list events: %w", err)
@@ -78,7 +96,7 @@ func (e *Store) Add(ctx context.Context, eventsToAdd ...types.KeyedEvent) error 
 			currentEvents = make([]types.Event, 0, 1)
 		}
 
-		if len(currentEvents) > 0 && currentEvents[len(currentEvents)-1].EventType == keyedEvent.EventType {
+		if len(currentEvents) > 0 && currentEvents[len(currentEvents)-1].EventType >= keyedEvent.EventType {
 			continue
 		}
 
@@ -101,7 +119,7 @@ func (e *Store) Add(ctx context.Context, eventsToAdd ...types.KeyedEvent) error 
 	return nil
 }
 
-func (e *Store) InitializeForGVK(ctx context.Context, ns string) error {
+func (e *Store) InitializeForGVK(ctx context.Context, ns string, list unstructured.UnstructuredList) error {
 	cm, err := e.getGVKConfigMap(ctx)
 	if err != nil && !errors.IsNotFound(err) {
 		return errors2.Wrap(err, fmt.Sprintf("failed to get magpie ConfigMap [%s]", e.getCMName()))
@@ -117,14 +135,6 @@ func (e *Store) InitializeForGVK(ctx context.Context, ns string) error {
 		}
 	}
 
-	list := unstructured.UnstructuredList{Items: []unstructured.Unstructured{}}
-
-	list.SetGroupVersionKind(e.gvk)
-	err = e.client.List(ctx, &list, &client.ListOptions{})
-	if err != nil {
-		return errors2.Wrap(err, fmt.Sprintf("failed to list e.gvk [%s]", e.gvk.String()))
-	}
-
 	currentGVKids := make([]string, len(list.Items))
 	for index, item := range list.Items {
 		currentGVKids[index] = e.GetResourceKeyFromUnstructured(item).String()
@@ -133,9 +143,9 @@ func (e *Store) InitializeForGVK(ctx context.Context, ns string) error {
 	eventsToAdd := make([]types.KeyedEvent, 0)
 	for keyString := range cm.Data {
 		if !slices.Contains(currentGVKids, keyString) {
-			key, err := e.parseResourceKeyFromString(keyString)
+			key, err := parseResourceKeyFromString(keyString)
 			if err != nil {
-				return errors2.Wrapf(err, "failed to parse resource key [%s]", keyString)
+				return errors2.Wrapf(err, "failed to parse resource key from GVK ConfigMap [%s]", keyString)
 			}
 
 			eventsToAdd = append(eventsToAdd, types.KeyedEvent{Key: key, Event: types.Event{EventType: types.InferredDelete}})
@@ -144,7 +154,7 @@ func (e *Store) InitializeForGVK(ctx context.Context, ns string) error {
 
 	for index, keyString := range currentGVKids {
 		updated := e.addObjToConfigMap(list.Items[index], cm)
-		key, err := e.parseResourceKeyFromString(keyString)
+		key, err := parseResourceKeyFromString(keyString)
 		if err != nil {
 			return errors2.Wrapf(err, "failed to parse resource key [%s]", keyString)
 		}
@@ -164,6 +174,9 @@ func (e *Store) InitializeForGVK(ctx context.Context, ns string) error {
 }
 
 func (e *Store) GetResourceKeyFromUnstructured(obj unstructured.Unstructured) types.ResourceKey {
+	if obj.GetUID() == "" {
+		fmt.Println("here")
+	}
 	return e.getResourceKey(obj.GetNamespace(), obj.GetName(), obj.GetUID())
 }
 
@@ -173,8 +186,7 @@ func (e *Store) getResourceKey(ns, name string, uid ktypes.UID) types.ResourceKe
 			Namespace: ns,
 			Name:      name,
 		},
-		UID:              uid,
-		GroupVersionKind: e.gvk,
+		UID: uid,
 	}
 }
 
@@ -187,15 +199,16 @@ func (e *Store) addObjToConfigMap(obj unstructured.Unstructured, cm *v1.ConfigMa
 		cm.Data = make(map[string]string)
 	}
 	cm.Data[e.GetResourceKeyFromUnstructured(obj).String()] = obj.GetCreationTimestamp().String()
+
 	return true
 }
 
-func (e *Store) parseResourceKeyFromString(key string) (types.ResourceKey, error) {
+func parseResourceKeyFromString(key string) (types.ResourceKey, error) {
 	parts := strings.Split(key, "_")
 	if len(parts) != 3 {
 		return types.ResourceKey{}, fmt.Errorf("invalid resource key string [%s], should be of format \"Namespace-Name-UID\"", key)
 	}
-	return types.ResourceKey{NamespacedName: ktypes.NamespacedName{Namespace: parts[0], Name: parts[1]}, UID: ktypes.UID(parts[2]), GroupVersionKind: e.gvk}, nil
+	return types.ResourceKey{NamespacedName: ktypes.NamespacedName{Namespace: parts[0], Name: parts[1]}, UID: ktypes.UID(parts[2])}, nil
 }
 
 func (e *Store) getGVKConfigMap(ctx context.Context) (*v1.ConfigMap, error) {
@@ -220,16 +233,40 @@ func (e *Store) listEventsFromConfigMap(cm *v1.ConfigMap, key types.ResourceKey)
 		return nil, nil
 	}
 
-	v, ok := cm.Data[key.String()]
+	val, ok := cm.Data[key.String()]
 	if !ok {
 		return nil, nil
 	}
 
 	var events []types.Event
-	if err := json.Unmarshal([]byte(v), &events); err != nil {
+	if err := json.Unmarshal([]byte(val), &events); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal events: %w", err)
 	}
 	return events, nil
+}
+
+func inferFullKey(cm *v1.ConfigMap, resourceKey types.ResourceKey) (types.ResourceKey, bool, error) {
+	_, ok := cm.Data[resourceKey.String()]
+	if ok {
+		return resourceKey, true, nil
+	}
+
+	if resourceKey.UID != "" {
+		return types.ResourceKey{}, false, nil
+	}
+
+	for key := range cm.Data {
+		if !strings.HasPrefix(key, resourceKey.String()) {
+			continue
+		}
+		matchedKey, err := parseResourceKeyFromString(key)
+		if err != nil {
+			return types.ResourceKey{}, false, fmt.Errorf("failed to parse resource key [%s]: %w", key, err)
+		}
+		return matchedKey, true, nil
+	}
+	return types.ResourceKey{}, false, nil
+
 }
 
 func (e *Store) addEventsToConfigMap(cm *v1.ConfigMap, key types.ResourceKey, events []types.Event) error {
